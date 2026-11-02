@@ -1,38 +1,55 @@
-# 导入socket库:
-import socket,time,threading
-import gzip
+# encoding: utf-8
+import errno
+import select
+import socket
 import time
- 
 
-# 创建一个socket:
-# AF_INET指定使用IPv4协议，如果要用更先进的IPv6，就指定为AF_INET6。SOCK_STREAM指定使用面向流的
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-# 监听端口:
-s.bind(('192.168.123.30', 9000))
-s.listen(5)
+listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.bind(('0.0.0.0', 9000))
+listener.listen(128)
+listener.setblocking(False)
+
+poller = select.poll()
+poller.register(listener, select.POLLIN)
+connections = {}
 print('Waiting for connection...')
-#处理函数
-def receivemsg(sock, addr):
-    print('Accept new connection from %s:%s...' % addr)
-    # sock.send(b'Welcome!')
-    while True:
-        localtime = time.strftime("%Y-%m-%d %X",time.localtime())
-        localdate = time.strftime("%Y-%m-%d",time.localtime())
-        data = sock.recv(1024)
-        data = data.decode('utf-8','ignore').replace('#END#','').strip()
-        time.sleep(1)
-        if data:
-            print(localtime,data)
-            f = open(localdate +'.txt',"a",encoding='UTF-8')
-            f.write(localtime + data + '\n')
-        if not data:
-            break
-        # sock.send(('Hello, %s!' % data.decode('utf-8')).encode('utf-8'))
-    sock.close()
-    print('Connection from %s:%s closed.' % addr)
+
 while True:
-# 接受一个新连接:
-    sock, addr = s.accept()
-    # 创建新线程来处理TCP连接:
-    t = threading.Thread(target=receivemsg,args=(sock, addr))
-    t.start()
+    for fd, events in poller.poll():
+        if fd == listener.fileno():
+            if events & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                raise RuntimeError('Listener failed')
+            try:
+                sock, addr = listener.accept()
+            except socket.error as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                    continue
+                raise
+            sock.setblocking(False)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            connections[sock.fileno()] = sock
+            poller.register(sock, select.POLLIN)
+            continue
+
+        sock = connections[fd]
+        try:
+            data = sock.recv(1024)
+        except socket.error as exc:
+            if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
+                if not events & (select.POLLERR | select.POLLHUP | select.POLLNVAL):
+                    continue
+            data = b''
+        if not data:
+            poller.unregister(fd)
+            del connections[fd]
+            sock.close()
+            continue
+
+        data = data.decode('utf-8', 'ignore').replace('#END#', '').strip()
+        if data:
+            now = time.localtime()
+            timestamp = time.strftime('%Y-%m-%d %X', now)
+            date = time.strftime('%Y-%m-%d', now)
+            with open(date + '.txt', 'ab') as output:
+                output.write((timestamp + data + '\n').encode('utf-8'))
